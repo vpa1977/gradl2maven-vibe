@@ -1,0 +1,6 @@
+pluginManagement {
+    includeBuild 'plugin'
+}
+
+rootProject.name = 'gradle-to-makefile'
+include 'example'

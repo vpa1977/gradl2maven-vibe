@@ -1,0 +1,33 @@
+plugins {
+    id 'java-gradle-plugin'
+    id 'maven-publish'
+    id("com.gradle.plugin-publish") version "2.1.1"
+    id 'groovy'
+}
+
+group = 'com.github.rockcrafters'
+version = '1.0.0'
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation gradleApi()
+}
+
+gradlePlugin {
+    plugins {
+        gradle2makefile {
+            id = 'com.github.vpa1977.gradle2makefile'
+            implementationClass = 'com.github.vpa1977.gradle2makefile.GradleToMakefilePlugin'
+        }
+        gradle2pom {
+            id = 'com.github.vpa1977.gradle2pom'
+            implementationClass = 'com.github.vpa1977.gradle2makefile.GradleToPOMPlugin'
+        }
+    }
+}
+
+java {
+}
