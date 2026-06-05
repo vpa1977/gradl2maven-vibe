@@ -228,7 +228,7 @@ public class GradleToPOMPlugin implements Plugin<Project> {
 
         Set<Dependency> deps = new LinkedHashSet<>();
 
-        for (String name : new String[]{"compileClasspath"}) {
+        for (String name : new String[]{"implementation", "compileClasspath"}) {
             Configuration cfg = project.getConfigurations().findByName(name);
             if (cfg == null) {
                 continue;
