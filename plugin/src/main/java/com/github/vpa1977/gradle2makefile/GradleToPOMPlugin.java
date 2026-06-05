@@ -51,16 +51,19 @@ public class GradleToPOMPlugin implements Plugin<Project> {
                     project.getRootProject().getName(), project.getName());
         }
 
-        project.getAllprojects().forEach( entry -> entry.afterEvaluate(
-                p -> {
-                    try {
-                        generatePom(p);
-                    } catch (IOException e) {
-                        p.getLogger().error("gradle2pom: failed to generate pom.xml for project '{}': {}",
-                                p.getName(), e.getMessage(), e);
+        project.getGradle().buildFinished(result -> {
+            project.getAllprojects().forEach( entry -> entry.afterEvaluate(
+                    p -> {
+                        try {
+                            generatePom(p);
+                        } catch (IOException e) {
+                            p.getLogger().error("gradle2pom: failed to generate pom.xml for project '{}': {}",
+                                    p.getName(), e.getMessage(), e);
+                        }
                     }
-                }
-        ));
+            ));
+        });
+
     }
 
     // -------------------------------------------------------------------------
