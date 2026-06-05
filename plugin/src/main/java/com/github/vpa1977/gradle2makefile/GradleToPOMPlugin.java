@@ -8,6 +8,12 @@ import org.gradle.api.artifacts.ProjectDependency;
 import org.gradle.api.artifacts.ResolvedArtifact;
 import org.gradle.api.artifacts.ResolvedDependency;
 import org.gradle.api.initialization.Settings;
+import org.gradle.api.plugins.PluginCollection;
+import org.gradle.api.publish.PublishingExtension;
+import org.gradle.api.publish.maven.MavenPublication;
+import org.gradle.api.publish.maven.plugins.MavenPublishPlugin;
+
+import org.gradle.api.tasks.compile.JavaCompile;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -37,6 +43,24 @@ import java.util.Set;
 public class GradleToPOMPlugin implements Plugin<Project> {
 
     private record Dependency(String groupId, String artifactId, String version){};
+
+    /**
+     * Holds the compiler options gathered from JavaCompile tasks.
+     * Classpath, sourcepath, and source-file arguments are excluded.
+     *
+     * @param release    value of {@code --release} / {@code options.release}, or {@code null}
+     * @param sourceCompatibility  value of {@code -source} / {@code options.sourceCompatibility}, or {@code null}
+     * @param targetCompatibility  value of {@code -target} / {@code options.targetCompatibility}, or {@code null}
+     * @param encoding   value of {@code options.encoding}, or {@code null}
+     * @param compilerArgs extra {@code -Xlint} / other flags from {@code options.compilerArgs}
+     *                     (classpath/sourcepath entries are stripped)
+     */
+    private record JavaCompileOptions(
+            String release,
+            String sourceCompatibility,
+            String targetCompatibility,
+            String encoding,
+            List<String> compilerArgs) {};
 
     /** Build-helper-maven-plugin version used for add-source executions. */
     private static final String BUILD_HELPER_VERSION = "3.5.0";
@@ -70,18 +94,28 @@ public class GradleToPOMPlugin implements Plugin<Project> {
     // -------------------------------------------------------------------------
 
     private void generatePom(Project project) throws IOException {
+
         File pomFile = new File(project.getProjectDir(), "pom.xml");
 
         String groupId    = stringOf(project.getGroup(), "com.example");
         String artifactId = project.getName();
         String version    = stringOf(project.getVersion(), "1.0-SNAPSHOT");
 
+        Dependency mavenArtifact = getMavenCoordinates(project);
+        if (mavenArtifact != null) {
+            groupId = mavenArtifact.groupId();
+            artifactId = mavenArtifact.artifactId();
+            version = mavenArtifact.version();
+        }
+
         var compileDeps = resolveImplementationDeps(project);
+
         // Annotation-processor deps must also be on the compile classpath so that
         // generated sources (already on disk) can reference their API types.
        // mergeAnnotationProcessorDeps(project, compileDeps);
         List<String> generatedSourceDirs   = findGeneratedSourceDirs(project);
         boolean hasScala                   = projectHasScalaSources(project);
+        JavaCompileOptions compilerOptions = collectCompilerOptions(project);
 
         // For the root project, collect submodule paths for the <modules> section.
         // For non-root projects, collect sibling project() dependencies.
@@ -91,19 +125,49 @@ public class GradleToPOMPlugin implements Plugin<Project> {
             for (Project child : project.getAllprojects()) {
                 if (child == project) continue;
                 String rel = relativePath(project, child.getProjectDir());
+                if ("buildSrc".equals(rel)) continue; // special project with build script
                 submodules.add(rel);
             }
         } else {
-            projectDeps = new ArrayList<>();//resolveProjectDeps(project);
+            projectDeps = resolveProjectDeps(project);
         }
 
         try (FileWriter w = new FileWriter(pomFile)) {
             w.write(pomXml(groupId, artifactId, version, compileDeps, projectDeps,
-                    generatedSourceDirs, hasScala, submodules));
+                    generatedSourceDirs, hasScala, submodules, compilerOptions));
         }
 
         project.getLogger().lifecycle("gradle2pom: pom.xml written to {}",
                 pomFile.getAbsolutePath());
+    }
+
+    /**
+     * Get project's maven publication coordinates. The project may produce multiple artifacts,
+     * this case is not supported.
+     * @param project
+     * @return
+     */
+    private Dependency getMavenCoordinates(Project project) {
+        PluginCollection<MavenPublishPlugin> plugins = project.getPlugins().withType(MavenPublishPlugin.class);
+        if (plugins.isEmpty()) {
+            return null;
+        }
+        PublishingExtension publishing = project.getExtensions()
+                .getByType(PublishingExtension.class);
+        var collection = publishing.getPublications().withType(MavenPublication.class);
+        var dependencies = new HashSet<>(collection.stream()
+                .map(publication -> new Dependency(publication.getGroupId(), publication.getArtifactId(), publication.getVersion()))
+                .toList());
+
+        if (dependencies.size() > 1) {
+            project.getLogger().error("Multiple publications found in project "+ project.getName());
+            dependencies.stream().forEach( x -> {
+                    project.getLogger().error(x.groupId() + ":"+x.artifactId() + ":" + x.version());
+            });
+            throw new IllegalArgumentException("Project produces multiple publications, not supported yet");
+        }
+        var dep = dependencies.stream().findAny();
+        return dep.orElseGet( () -> null);
     }
 
     // -------------------------------------------------------------------------
@@ -125,15 +189,42 @@ public class GradleToPOMPlugin implements Plugin<Project> {
      */
     private List<Dependency> resolveImplementationDeps(Project project) {
 
-        Set<Dependency> deps = new HashSet<>();
+        Set<Dependency> deps = new LinkedHashSet<>();
 
-        for (String name : new String[]{"implementation", "compileClasspath"}) {
+        // Collect module IDs that belong to project() dependencies so we can
+        // replace them with proper Maven publication coordinates afterwards.
+        Set<String> projectDepModuleIds = new HashSet<>();
+
+        for (String name : new String[]{"compileClasspath"}) {
             Configuration cfg = project.getConfigurations().findByName(name);
             if (cfg == null) {
                 continue;
             }
+
+            for (org.gradle.api.artifacts.Dependency declared : cfg.getAllDependencies()) {
+                if (declared instanceof ProjectDependency pd) {
+                    Project depProject = project.project(pd.getPath());
+                    // Record the resolved module ID so we can skip it in the artifact pass.
+                    projectDepModuleIds.add(depProject.getGroup() + ":" + depProject.getName());
+
+                    Dependency mavenCoords = getMavenCoordinates(depProject);
+                    if (mavenCoords != null) {
+                        deps.add(mavenCoords);
+                    } else {
+                        // Fallback: use the project's own group/name/version.
+                        deps.add(new Dependency(
+                                depProject.getGroup().toString(),
+                                depProject.getName(),
+                                depProject.getVersion().toString()));
+                    }
+                }
+            }
+
             if (!cfg.isCanBeResolved()) {
-                for (var dep : cfg.getAllDependencies()) {
+                for (org.gradle.api.artifacts.Dependency dep : cfg.getAllDependencies()) {
+                    if (dep instanceof ProjectDependency) {
+                        continue; // already handled above
+                    }
                     deps.add(new Dependency(dep.getGroup(), dep.getName(), dep.getVersion()));
                 }
             } else {
@@ -142,21 +233,21 @@ public class GradleToPOMPlugin implements Plugin<Project> {
                     Set<ResolvedDependency> firstLevel =
                             cfg.getResolvedConfiguration().getFirstLevelModuleDependencies();
                     collectArtifacts(firstLevel, new LinkedHashSet<>(), artifacts);
-                    artifacts.stream().forEach( x -> {
+                    for (ResolvedArtifact x : artifacts) {
                         var id = x.getModuleVersion().getId();
+                        String moduleKey = id.getGroup() + ":" + id.getName();
+                        if (projectDepModuleIds.contains(moduleKey)) {
+                            continue; // replaced by getMavenCoordinates() above
+                        }
                         deps.add(new Dependency(id.getGroup(), id.getName(), id.getVersion()));
-                    });
+                    }
                 } catch (Exception e) {
                     project.getLogger().debug(
                             "gradle2pom: could not resolve configuration '{}': {}", name, e.getMessage());
                 }
             }
-            /*
-
-             */
         }
         return new ArrayList<>(deps);
-        //return artifacts;
     }
 
     /**
@@ -203,7 +294,9 @@ public class GradleToPOMPlugin implements Plugin<Project> {
     private List<Dependency> resolveProjectDeps(Project project) {
         ArrayList<Dependency> seen = new ArrayList<>();
         for (var p : project.getSubprojects()) {
-            seen.add(new Dependency(p.getGroup().toString(), p.getName(), p.getVersion().toString()));
+            Dependency dep =getMavenCoordinates(p);
+            if (dep != null)
+                seen.add(dep);
         }
         return seen;
     }
@@ -220,6 +313,94 @@ public class GradleToPOMPlugin implements Plugin<Project> {
             out.addAll(dep.getModuleArtifacts());
             collectArtifacts(dep.getChildren(), seen, out);
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Compiler options
+    // -------------------------------------------------------------------------
+
+    /**
+     * Iterates over all {@link JavaCompile} tasks in the project and collects
+     * their compiler options. Classpath, sourcepath, and file-list arguments
+     * are intentionally excluded because Maven manages those separately.
+     *
+     * <p>When the project has no {@code JavaCompile} tasks the method returns
+     * an empty {@link JavaCompileOptions} record (all fields {@code null} /
+     * empty list).
+     */
+    private JavaCompileOptions collectCompilerOptions(Project project) {
+        String release              = null;
+        String sourceCompatibility  = null;
+        String targetCompatibility  = null;
+        String encoding             = null;
+        List<String> compilerArgs   = new ArrayList<>();
+
+        // Prefixes of compiler arguments that refer to classpath / sourcepath / file lists.
+        // These are Maven's responsibility and must not be duplicated in the POM.
+        Set<String> excludedPrefixes = Set.of(
+                "-classpath", "-cp", "--class-path",
+                "-sourcepath", "--source-path",
+                "-Werror"
+        );
+
+        for (JavaCompile task : project.getTasks().withType(JavaCompile.class)) {
+            var opts = task.getOptions();
+
+            // --release takes precedence over -source/-target
+            if (release == null && opts.getRelease().isPresent()) {
+                release = opts.getRelease().get().toString();
+            }
+
+            // Source / target compatibility (set directly on the task)
+            if (sourceCompatibility == null) {
+                try {
+                    String sc = task.getSourceCompatibility();
+                    if (sc != null && !sc.isEmpty()) {
+                        sourceCompatibility = sc;
+                    }
+                } catch (Exception ignored) {}
+            }
+            if (targetCompatibility == null) {
+                try {
+                    String tc = task.getTargetCompatibility();
+                    if (tc != null && !tc.isEmpty()) {
+                        targetCompatibility = tc;
+                    }
+                } catch (Exception ignored) {}
+            }
+
+            // Encoding
+            if (encoding == null && opts.getEncoding() != null && !opts.getEncoding().isEmpty()) {
+                encoding = opts.getEncoding();
+            }
+
+            // Extra compiler args — strip classpath/sourcepath/file entries
+            List<String> raw = opts.getCompilerArgs();
+            if (raw != null) {
+                for (int i = 0; i < raw.size(); i++) {
+                    String arg = raw.get(i);
+                    boolean excluded = false;
+                    for (String prefix : excludedPrefixes) {
+                        if (arg.startsWith(prefix)) {
+                            excluded = true;
+                            // If this is a two-token option (flag + value), skip value too.
+                            if (!arg.contains("=") && !arg.equals(prefix)) {
+                                // value is part of the same token — already handled
+                            } else if (arg.equals(prefix) && i + 1 < raw.size()) {
+                                i++; // skip the next token (the value)
+                            }
+                            break;
+                        }
+                    }
+                    if (!excluded && !compilerArgs.contains(arg)) {
+                        compilerArgs.add(arg);
+                    }
+                }
+            }
+        }
+
+        return new JavaCompileOptions(release, sourceCompatibility, targetCompatibility,
+                encoding, compilerArgs);
     }
 
     // -------------------------------------------------------------------------
@@ -286,7 +467,8 @@ public class GradleToPOMPlugin implements Plugin<Project> {
                            List<Dependency> projectDeps,
                            List<String> generatedSourceDirs,
                            boolean hasScala,
-                           List<String> submodules) {
+                           List<String> submodules,
+                           JavaCompileOptions compilerOptions) {
         StringBuilder sb = new StringBuilder();
 
         sb.append("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
@@ -307,7 +489,7 @@ public class GradleToPOMPlugin implements Plugin<Project> {
         sb.append("\n");
 
         sb.append("<properties>\n");
-        sb.append(" <maven.compiler.release>17</maven.compiler.release>\n");
+        sb.append(" <maven.compiler.release>21</maven.compiler.release>\n");
         sb.append("</properties>\n");
 
         // ---- modules (root project only) ------------------------------------
@@ -352,6 +534,12 @@ public class GradleToPOMPlugin implements Plugin<Project> {
         sb.append("  <build>\n");
         sb.append("    <plugins>\n");
 
+        // maven-compiler-plugin: carry over JavaCompile task options
+        String compilerPluginXml = mavenCompilerPlugin(compilerOptions);
+        if (compilerPluginXml != null) {
+            sb.append(compilerPluginXml);
+        }
+
         // build-helper-maven-plugin: add generated source directories (only when present)
         if (!generatedSourceDirs.isEmpty()) {
             sb.append(buildHelperPlugin(generatedSourceDirs));
@@ -366,6 +554,58 @@ public class GradleToPOMPlugin implements Plugin<Project> {
         sb.append("  </build>\n");
 
         sb.append("</project>\n");
+        return sb.toString();
+    }
+
+    /**
+     * Renders a {@code maven-compiler-plugin} configuration block from the
+     * collected {@link JavaCompileOptions}.
+     *
+     * <p>Returns {@code null} when there is nothing meaningful to emit (all
+     * fields are null/empty) so the caller can omit the plugin entirely.
+     */
+    private String mavenCompilerPlugin(JavaCompileOptions opts) {
+        if (opts == null) {
+            return null;
+        }
+        boolean hasRelease = opts.release() != null;
+        boolean hasSource  = opts.sourceCompatibility() != null;
+        boolean hasTarget  = opts.targetCompatibility() != null;
+        boolean hasEncoding = opts.encoding() != null;
+        boolean hasArgs    = !opts.compilerArgs().isEmpty();
+
+        if (!hasRelease && !hasSource && !hasTarget && !hasEncoding && !hasArgs) {
+            return null;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("      <plugin>\n");
+        sb.append("        <groupId>org.apache.maven.plugins</groupId>\n");
+        sb.append("        <artifactId>maven-compiler-plugin</artifactId>\n");
+        sb.append("        <configuration>\n");
+
+        if (hasRelease) {
+            sb.append("          <release>").append(escape(opts.release())).append("</release>\n");
+        }
+        if (hasSource) {
+            sb.append("          <source>").append(escape(opts.sourceCompatibility())).append("</source>\n");
+        }
+        if (hasTarget) {
+            sb.append("          <target>").append(escape(opts.targetCompatibility())).append("</target>\n");
+        }
+        if (hasEncoding) {
+            sb.append("          <encoding>").append(escape(opts.encoding())).append("</encoding>\n");
+        }
+        if (hasArgs) {
+            sb.append("          <compilerArgs>\n");
+            for (String arg : opts.compilerArgs()) {
+                sb.append("            <arg>").append(escape(arg)).append("</arg>\n");
+            }
+            sb.append("          </compilerArgs>\n");
+        }
+
+        sb.append("        </configuration>\n");
+        sb.append("      </plugin>\n");
         return sb.toString();
     }
 
