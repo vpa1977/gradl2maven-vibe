@@ -20,6 +20,7 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -62,6 +63,8 @@ public class GradleToPOMPlugin implements Plugin<Project> {
             String encoding,
             List<String> compilerArgs) {};
 
+    private HashMap<String, Dependency> projectDepencyCache = new HashMap<>();
+
     /** Build-helper-maven-plugin version used for add-source executions. */
     private static final String BUILD_HELPER_VERSION = "3.5.0";
 
@@ -76,6 +79,7 @@ public class GradleToPOMPlugin implements Plugin<Project> {
         }
 
         project.getGradle().buildFinished(result -> {
+            populateDependencyCache(project.getAllprojects());
             project.getAllprojects().forEach( entry -> {
                         try {
                             generatePom(entry);
@@ -87,6 +91,39 @@ public class GradleToPOMPlugin implements Plugin<Project> {
             );
         });
 
+    }
+
+    /**
+     * Pre-populates {@link #projectDepencyCache} for every project in the build.
+     *
+     * <p>The cache key is {@code project.getGroup() + ":" + project.getName()}.
+     * The value is the project's Maven publication coordinates obtained via
+     * {@link #getMavenCoordinates(Project)}. When a project does not apply the
+     * {@code maven-publish} plugin the coordinates fall back to the project's
+     * own {@code group}, {@code name}, and {@code version}.
+     *
+     * <p>Must be called before any {@link #generatePom(Project)} invocation so
+     * that {@link #resolveImplementationDeps(Project)} can look up sibling
+     * project coordinates without calling {@link #getMavenCoordinates(Project)}
+     * repeatedly.
+     *
+     * @param projects the full set of projects in the build
+     *                 (typically {@code project.getAllprojects()})
+     */
+    private void populateDependencyCache(Iterable<Project> projects) {
+        projectDepencyCache.clear();
+        for (Project p : projects) {
+            String key = p.getGroup() + ":" + p.getName();
+            Dependency coords = getMavenCoordinates(p);
+            if (coords == null) {
+                // Fallback: use the project's own coordinates.
+                coords = new Dependency(
+                        p.getGroup().toString(),
+                        p.getName(),
+                        p.getVersion().toString());
+            }
+            projectDepencyCache.put(key, coords);
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -191,41 +228,18 @@ public class GradleToPOMPlugin implements Plugin<Project> {
 
         Set<Dependency> deps = new LinkedHashSet<>();
 
-        // Collect module IDs that belong to project() dependencies so we can
-        // replace them with proper Maven publication coordinates afterwards.
-        Set<String> projectDepModuleIds = new HashSet<>();
-
         for (String name : new String[]{"compileClasspath"}) {
             Configuration cfg = project.getConfigurations().findByName(name);
             if (cfg == null) {
                 continue;
             }
 
-            for (org.gradle.api.artifacts.Dependency declared : cfg.getAllDependencies()) {
-                if (declared instanceof ProjectDependency pd) {
-                    Project depProject = project.project(pd.getPath());
-                    // Record the resolved module ID so we can skip it in the artifact pass.
-                    projectDepModuleIds.add(depProject.getGroup() + ":" + depProject.getName());
-
-                    Dependency mavenCoords = getMavenCoordinates(depProject);
-                    if (mavenCoords != null) {
-                        deps.add(mavenCoords);
-                    } else {
-                        // Fallback: use the project's own group/name/version.
-                        deps.add(new Dependency(
-                                depProject.getGroup().toString(),
-                                depProject.getName(),
-                                depProject.getVersion().toString()));
-                    }
-                }
-            }
-
             if (!cfg.isCanBeResolved()) {
-                for (org.gradle.api.artifacts.Dependency dep : cfg.getAllDependencies()) {
-                    if (dep instanceof ProjectDependency) {
-                        continue; // already handled above
-                    }
-                    deps.add(new Dependency(dep.getGroup(), dep.getName(), dep.getVersion()));
+                for (org.gradle.api.artifacts.Dependency id : cfg.getAllDependencies()) {
+                    String moduleKey = id.getGroup() + ":" + id.getName();
+                    deps.add(projectDepencyCache.getOrDefault
+                            (moduleKey,
+                                    new Dependency(id.getGroup(), id.getName(), id.getVersion())));
                 }
             } else {
                 try {
@@ -236,10 +250,9 @@ public class GradleToPOMPlugin implements Plugin<Project> {
                     for (ResolvedArtifact x : artifacts) {
                         var id = x.getModuleVersion().getId();
                         String moduleKey = id.getGroup() + ":" + id.getName();
-                        if (projectDepModuleIds.contains(moduleKey)) {
-                            continue; // replaced by getMavenCoordinates() above
-                        }
-                        deps.add(new Dependency(id.getGroup(), id.getName(), id.getVersion()));
+                        deps.add(projectDepencyCache.getOrDefault
+                                (moduleKey,
+                                        new Dependency(id.getGroup(), id.getName(), id.getVersion())));
                     }
                 } catch (Exception e) {
                     project.getLogger().debug(
@@ -408,47 +421,46 @@ public class GradleToPOMPlugin implements Plugin<Project> {
     // -------------------------------------------------------------------------
 
     /**
-     * Scans {@code build/generated/sources/<directory>/java} under the project directory
-     * and returns the relative paths of directories that actually exist on disk.
-     * Returns an empty list when no generated source directories are present
-     * (the build-helper-maven-plugin is then omitted from the POM entirely).
+     * Recursively walks {@code build/generated} under the project directory and
+     * returns the relative paths of every directory whose path ends with
+     * {@code main/java} (i.e. matches the standard Gradle generated-sources
+     * layout).  Returns an empty list when none are found, in which case the
+     * build-helper-maven-plugin is omitted from the generated POM entirely.
      */
     private List<String> findGeneratedSourceDirs(Project project) {
         List<String> dirs = new ArrayList<>();
 
-        File mainGenerated = new File(project.getProjectDir(), "build/generated/main/java");
-        if (mainGenerated.isDirectory()){
-            dirs.add(relativePath(project, mainGenerated));
-        }
-
-        File generatedSources = new File(project.getProjectDir(),
-                "build/generated/sources");
-        if (!generatedSources.isDirectory()) {
-            // No generated sources exist yet — omit the build-helper plugin.
+        File buildGenerated = new File(project.getProjectDir(), "build/generated");
+        if (!buildGenerated.isDirectory()) {
             return dirs;
         }
 
-        File[] children = generatedSources.listFiles();
-        if (children != null) {
-            for (File child : children) {
-                if (!child.isDirectory()) {
-                    continue;
-                }
-                File javaDir = new File(child, "java");
-                if (javaDir.isDirectory()) {
-                    // Prefer the "main" sub-directory when it exists.
-                    File mainDir = new File(javaDir, "main");
-                    if (mainDir.isDirectory()) {
-                        dirs.add(relativePath(project, mainDir));
-                    } else {
-                        dirs.add(relativePath(project, javaDir));
-                    }
-                }
+        collectMainJavaDirs(buildGenerated, "java" + File.separator + "main", project, dirs);
+        collectMainJavaDirs(buildGenerated, "main" + File.separator + "java", project, dirs);
+
+        return dirs;
+    }
+
+    /**
+     * Recursively descends into {@code dir}, adding any subdirectory whose
+     * absolute path ends with {@code …/main/java} to {@code result}.
+     */
+    private void collectMainJavaDirs(File dir, String suffix, Project project, List<String> result) {
+        File[] children = dir.listFiles();
+        if (children == null) {
+            return;
+        }
+        for (File child : children) {
+            if (!child.isDirectory()) {
+                continue;
+            }
+            String abs = child.getAbsolutePath();
+            if (abs.endsWith(File.separator + suffix) || abs.equals(suffix)) {
+                result.add(relativePath(project, child));
+            } else {
+                collectMainJavaDirs(child, suffix, project, result);
             }
         }
-
-        // dirs may still be empty if no */java sub-directory was found.
-        return dirs;
     }
 
     private boolean projectHasScalaSources(Project project) {
